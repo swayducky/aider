@@ -12,7 +12,8 @@ from prompt_toolkit.enums import EditingMode
 from aider import __version__, models, utils
 from aider.args import get_parser
 from aider.coders import Coder
-from aider.commands import SwitchModel
+from aider.commands import Commands, SwitchCoder
+from aider.history import ChatSummary
 from aider.io import InputOutput
 from aider.llm import litellm  # noqa: F401; properly init litellm on launch
 from aider.repo import GitRepo
@@ -327,7 +328,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     if not args.verify_ssl:
         import httpx
 
-        litellm.client_session = httpx.Client(verify=False)
+        litellm._load_litellm()
+        litellm._lazy_module.client_session = httpx.Client(verify=False)
 
     if args.dark_mode:
         args.user_input_color = "#32FF32"
@@ -371,10 +373,11 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     for fname in loaded_dotenvs:
         io.tool_output(f"Loaded {fname}")
 
-    fnames = [str(Path(fn).resolve()) for fn in args.files]
-    if len(args.files) > 1:
+    all_files = args.files + (args.file or [])
+    fnames = [str(Path(fn).resolve()) for fn in all_files]
+    if len(all_files) > 1:
         good = True
-        for fname in args.files:
+        for fname in all_files:
             if Path(fname).is_dir():
                 io.tool_error(f"{fname} is a directory, not provided alone.")
                 good = False
@@ -385,13 +388,13 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             return 1
 
     git_dname = None
-    if len(args.files) == 1:
-        if Path(args.files[0]).is_dir():
+    if len(all_files) == 1:
+        if Path(all_files[0]).is_dir():
             if args.git:
-                git_dname = str(Path(args.files[0]).resolve())
+                git_dname = str(Path(all_files[0]).resolve())
                 fnames = []
             else:
-                io.tool_error(f"{args.files[0]} is a directory, but --no-git selected.")
+                io.tool_error(f"{all_files[0]} is a directory, but --no-git selected.")
                 return 1
 
     # We can't know the git repo for sure until after parsing the args.
@@ -457,14 +460,38 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
     if args.show_model_warnings:
         models.sanity_check_models(io, main_model)
 
+    repo = None
+    if args.git:
+        try:
+            repo = GitRepo(
+                io,
+                fnames,
+                git_dname or ".",
+                args.aiderignore,
+                models=main_model.commit_message_models(),
+                attribute_author=args.attribute_author,
+                attribute_committer=args.attribute_committer,
+                attribute_commit_message=args.attribute_commit_message,
+                commit_prompt=args.commit_prompt,
+                subtree_only=args.subtree_only,
+            )
+        except FileNotFoundError:
+            pass
+
+    commands = Commands(io, None, verify_ssl=args.verify_ssl)
+
+    summarizer = ChatSummary(
+        [main_model.weak_model, main_model],
+        args.max_chat_history_tokens or main_model.max_chat_history_tokens,
+    )
+
     try:
         coder = Coder.create(
             main_model=main_model,
             edit_format=args.edit_format,
             io=io,
-            ##
+            repo=repo,
             fnames=fnames,
-            git_dname=git_dname,
             pretty=args.pretty,
             show_diffs=args.show_diffs,
             auto_commits=args.auto_commits,
@@ -476,17 +503,13 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
             code_theme=args.code_theme,
             stream=args.stream,
             use_git=args.git,
-            voice_language=args.voice_language,
-            aider_ignore_file=args.aiderignore,
-            max_chat_history_tokens=args.max_chat_history_tokens,
             restore_chat_history=args.restore_chat_history,
             auto_lint=args.auto_lint,
             auto_test=args.auto_test,
             lint_cmds=lint_cmds,
             test_cmd=args.test_cmd,
-            attribute_author=args.attribute_author,
-            attribute_committer=args.attribute_committer,
-            attribute_commit_message=args.attribute_commit_message,
+            commands=commands,
+            summarizer=summarizer,
         )
 
     except ValueError as err:
@@ -506,16 +529,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         utils.show_messages(messages)
         return
 
-    if args.commit:
-        if args.dry_run:
-            io.tool_output("Dry run enabled, skipping commit.")
-        else:
-            coder.commands.cmd_commit()
-        return
-
     if args.lint:
         coder.commands.cmd_lint(fnames=fnames)
-        return
 
     if args.test:
         if not args.test_cmd:
@@ -524,6 +539,14 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         test_errors = coder.commands.cmd_test(args.test_cmd)
         if test_errors:
             coder.run(test_errors)
+
+    if args.commit:
+        if args.dry_run:
+            io.tool_output("Dry run enabled, skipping commit.")
+        else:
+            coder.commands.cmd_commit()
+
+    if args.lint or args.test or args.commit:
         return
 
     if args.show_repo_map:
@@ -585,8 +608,8 @@ def main(argv=None, input=None, output=None, force_git_root=None, return_coder=F
         try:
             coder.run()
             return
-        except SwitchModel as switch:
-            coder = Coder.create(main_model=switch.model, io=io, from_coder=coder)
+        except SwitchCoder as switch:
+            coder = Coder.create(io=io, from_coder=coder, **switch.kwargs)
             coder.show_announcements()
 
 
